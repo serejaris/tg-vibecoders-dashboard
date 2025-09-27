@@ -19,8 +19,8 @@ export async function GET(request: Request) {
   if (!date) return badRequest('missing_date');
   if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return badRequest('invalid_date');
 
-  if (!process.env.OPENAI_API_KEY) {
-    return NextResponse.json({ error: 'missing_openai_key' }, { status: 503 });
+  if (!process.env.OPENROUTER_API_KEY) {
+    return NextResponse.json({ error: 'missing_openrouter_key' }, { status: 503 });
   }
 
   const chatId = chatIdParam && chatIdParam.trim() !== ''
@@ -39,10 +39,19 @@ export async function GET(request: Request) {
       return NextResponse.json({ error: e.message, request_id: reqId || null }, { status: 422 });
     }
     if (e?.name === 'AbortError') {
-      return NextResponse.json({ error: 'openai_timeout', request_id: reqId || null }, { status: 504 });
+      return NextResponse.json({ error: 'openrouter_timeout', request_id: reqId || null }, { status: 504 });
     }
-    if (e?.message === 'missing_openai_key') {
-      return NextResponse.json({ error: 'missing_openai_key', request_id: reqId || null }, { status: 503 });
+    if (e?.message === 'missing_openrouter_key') {
+      return NextResponse.json({ error: 'missing_openrouter_key', request_id: reqId || null }, { status: 503 });
+    }
+    if (e?.message === 'missing_openrouter_model') {
+      return NextResponse.json({ error: 'missing_openrouter_model', request_id: reqId || null }, { status: 503 });
+    }
+    if (e?.message === 'openrouter_timeout') {
+      return NextResponse.json({ error: 'openrouter_timeout', request_id: reqId || null }, { status: 504 });
+    }
+    if (e?.message === 'openrouter_empty_content') {
+      return NextResponse.json({ error: 'openrouter_empty_content', request_id: reqId || null }, { status: 502 });
     }
     return NextResponse.json({ error: 'internal_error', detail: String(e?.message || e), request_id: reqId || null }, { status: 500 });
   }

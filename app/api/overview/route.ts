@@ -2,9 +2,47 @@ import { NextResponse } from 'next/server';
 export const runtime = 'nodejs';
 import { Pool } from 'pg';
 
+// Enhanced pool configuration for Railway PostgreSQL
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: process.env.PGSSL === 'disable' ? false : { rejectUnauthorized: false },
+  ssl: process.env.PGSSL === 'disable' ? false : {
+    rejectUnauthorized: false,
+    sslmode: 'require'
+  },
+  max: 20, // maximum number of clients in pool
+  min: 2, // minimum number of clients in pool
+  connectionTimeoutMillis: 30000, // 30 seconds timeout for new connections
+  idleTimeoutMillis: 30000, // close idle clients after 30 seconds
+  allowExitOnIdle: true, // allow process to exit when all clients are idle
+  query_timeout: 60000, // 60 seconds query timeout
+  statement_timeout: 60000, // 60 seconds statement timeout
+  keepAlive: true, // keep TCP connection alive
+  keepAliveInitialDelayMillis: 10000, // initial delay for keep-alive
+});
+
+// Add error handler for the pool to catch background errors
+pool.on('error', (err, client) => {
+  console.error('Unexpected error on idle client:', err);
+  // Don't throw here, just log it
+});
+
+// Add connection event handler for debugging
+pool.on('connect', (client) => {
+  console.log('New client connected to database');
+});
+
+// Add acquire event handler for debugging
+pool.on('acquire', (client) => {
+  console.log('Client acquired from pool');
+});
+
+// Add release event handler for debugging
+pool.on('release', (err, client) => {
+  if (err) {
+    console.error('Error releasing client:', err);
+  } else {
+    console.log('Client released back to pool');
+  }
 });
 
 function normalizeUsernameOrId(row: any): string {
@@ -48,13 +86,78 @@ export async function GET(request: Request) {
   const chatFilterEnabled = !!(chatIdParam && chatIdParam.trim() !== '' && chatIdParam.toLowerCase() !== 'all');
 
   const now = new Date();
-  const since = new Date(now.getTime() - windowDays * 24 * 60 * 60 * 1000);
-  const until = now;
-  const baseWhere = `sent_at >= $1 AND sent_at < $2` + (chatFilterEnabled ? ` AND chat_id::text = $3` : '');
-  const baseWhereChatsOnly = `sent_at >= $1 AND sent_at < $2`;
-
-  const client = await pool.connect();
+  let since = new Date(now.getTime() - windowDays * 24 * 60 * 60 * 1000);
+  let until = now;
+  
+  // Add retry logic for database connection
+  let client;
+  let lastError;
+  const maxRetries = 3;
+  
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      console.log(`Database connection attempt ${attempt}/${maxRetries}`);
+      client = await pool.connect();
+      console.log('✅ Database connection successful');
+      break;
+    } catch (err) {
+      lastError = err;
+      console.error(`❌ Connection attempt ${attempt} failed:`, {
+        message: err.message,
+        code: err.code,
+        errno: err.errno,
+        syscall: err.syscall,
+      });
+      
+      if (attempt === maxRetries) {
+        console.error('🚨 All connection attempts failed. Database connection info:', {
+          databaseUrl: process.env.DATABASE_URL ? 'SET' : 'NOT_SET',
+          pgssl: process.env.PGSSL || 'default (enabled)',
+          poolTotalCount: pool.totalCount,
+          poolIdleCount: pool.idleCount,
+          poolWaitingCount: pool.waitingCount,
+        });
+        throw new Error(`Database connection failed after ${maxRetries} attempts: ${err.message}`);
+      }
+      
+      // Wait before retrying (exponential backoff)
+      const delay = Math.min(1000 * Math.pow(2, attempt - 1), 5000);
+      console.log(`⏳ Waiting ${delay}ms before retry...`);
+      await new Promise(resolve => setTimeout(resolve, delay));
+    }
+  }
+  
   try {
+    // Check if there's any data in the requested time window
+    const quickCountRes = await client.query(
+      `SELECT COUNT(*)::int AS cnt FROM messages WHERE sent_at >= $1 AND sent_at < $2`,
+      [since, until]
+    );
+    
+    // If no data in the requested window, use the actual data range
+    if (quickCountRes.rows[0].cnt === 0) {
+      const dataRangeRes = await client.query(
+        `SELECT MIN(sent_at) as min_date, MAX(sent_at) as max_date FROM messages`
+      );
+      
+      if (dataRangeRes.rows[0].min_date && dataRangeRes.rows[0].max_date) {
+        // Use the last N days of actual data
+        until = new Date(dataRangeRes.rows[0].max_date);
+        since = new Date(until.getTime() - windowDays * 24 * 60 * 60 * 1000);
+        
+        // Ensure we don't go before the earliest data
+        const minDate = new Date(dataRangeRes.rows[0].min_date);
+        if (since < minDate) {
+          since = minDate;
+        }
+        
+        console.log(`📊 Using actual data range: ${since.toISOString()} to ${until.toISOString()}`);
+      }
+    }
+    
+    const baseWhere = `sent_at >= $1 AND sent_at < $2` + (chatFilterEnabled ? ` AND chat_id::text = $3` : '');
+    const baseWhereChatsOnly = `sent_at >= $1 AND sent_at < $2`;
+
     const paramsBase: any[] = [since, until];
     if (chatFilterEnabled) paramsBase.push(chatIdParam);
     const extraOffset = chatFilterEnabled ? 1 : 0;
